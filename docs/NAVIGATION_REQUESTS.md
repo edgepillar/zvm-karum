@@ -40,3 +40,32 @@ requests are not fabricated, retried or substituted. In-flight HTTP cancellation
 and the earlier browser navigation timeout cause are not established by this fix.
 The complete original marketplace signature/receipt/balance predicates and all
 52 production-browser profiles remain required in the Node integration lane.
+
+
+## Collection permission refresh lifecycle
+
+The permission component retains at most four concurrent read calls and one
+pending refresh for the latest account, selected node and collection context.
+Requests made while a read or market action is active are coalesced, then run
+when that work settles. A completed action therefore does not depend on waiting
+for the five-second fallback timer. Hidden tabs do not start new batches;
+visibility restoration and focus request a current refresh.
+
+Synchronous context invalidation rejects obsolete success and failure, including
+account or endpoint A-to-B-to-A transitions. Revoke preparation and its later
+transaction guard retain that context generation. Polling the same context does
+not invalidate a valid transaction preparation. Detached rows and callbacks
+after unmount cannot dispatch another action or replace the current view.
+
+The original five-second polling interval remains for external changes and
+same-height replacements. Permission reads still use the production public
+client, original ABI and a strict boolean response. A request failure displays
+unknown permission. A signature, wallet response or queue completion does not
+establish an executed transaction. Real receipts remain the transaction runner's
+responsibility.
+
+The component controls execute the actual script with declared in-memory Vue,
+read and market capabilities. They establish lifecycle behavior and the four-read
+bound; they are not browser, SDK, settlement, public-chain or reorg execution.
+The complete unchanged Node marketplace cohort remains a separate integration
+gate when adopting this frontend revision.

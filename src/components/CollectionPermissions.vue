@@ -17,14 +17,17 @@ const market = useMarket()
 type Row = {collection: Address; name: string; approved: boolean | null; loading: boolean; error: string}
 const rows = ref<Row[]>([])
 let generation = 0
-let refreshing = false
+let contextGeneration = 0
+let disposed = false
+let queued = false
+let refreshing: Promise<void> | null = null
 let timer: ReturnType<typeof setInterval> | undefined
 
 const identity = computed(() => {
   const chainId = endpoint.chainId
   const operator = exchange()?.address
   const account = wallet.address
-  if (!chainId || !operator || !isAddress(operator) || !isAddress(props.owner) ||
+  if (endpoint.health !== 'ok' || wallet.chainId !== chainId || !chainId || !operator || !isAddress(operator) || !isAddress(props.owner) ||
     !account || account.toLowerCase() !== props.owner.toLowerCase() || wrongChain.value) return null
   return {chainId, operator: operator as Address, owner: props.owner as Address, endpoint: endpoint.rpc}
 })
@@ -37,72 +40,132 @@ const collections = computed(() => {
   }
   return [...unique.values()].sort((a, b) => a.collection.toLowerCase().localeCompare(b.collection.toLowerCase()))
 })
-const scope = computed(() => identity.value ? JSON.stringify([identity.value, collections.value.map(r => r.collection.toLowerCase())]) : '')
+const scope = computed(() => identity.value ? JSON.stringify([identity.value, collections.value.map(r => [r.collection.toLowerCase(), r.name])]) : '')
 
-async function refresh() {
+// One owned read batch at a time. Keep only one pending request for the
+// latest context; a skipped busy refresh must not wait for the next timer.
+function canRefresh() {
+  return !disposed && !!identity.value && !market.busy.value && !document.hidden
+}
+
+function refresh(): Promise<void> {
+  if (disposed || !identity.value) return Promise.resolve()
+  queued = true
+  if (refreshing || !canRefresh()) return refreshing ?? Promise.resolve()
+  // Register ownership before a client or reactive callback can run.
+  const run = Promise.resolve().then(async () => {
+    while (queued && canRefresh()) {
+      queued = false
+      await readPermissions()
+    }
+  })
+  let owned: Promise<void>
+  owned = run.finally(() => {
+    if (refreshing !== owned) return
+    refreshing = null
+    // A request can arrive between the final loop check and this continuation.
+    if (queued && canRefresh()) void refresh()
+  })
+  refreshing = owned
+  return owned
+}
+
+async function readPermissions() {
   const selected = identity.value
-  if (!selected || refreshing || market.busy.value) return
+  if (!selected || !canRefresh()) return
   const key = scope.value
   const epoch = ++generation
-  refreshing = true
-  const client = publicClient(selected.chainId)
+  const current = () => !disposed && epoch === generation && key === scope.value
   try {
+    const client = publicClient(selected.chainId)
     // Four reads at a time; the shared client's normal HTTP batching still applies.
     for (let offset = 0; offset < rows.value.length; offset += 4) {
-      if (epoch !== generation || key !== scope.value) return
+      if (!current() || !canRefresh()) return
       const batch = rows.value.slice(offset, offset + 4)
       await Promise.all(batch.map(async row => {
         row.loading = true
         try {
           const value = await client.readContract({address: row.collection, abi: collectionAbi,
             functionName: 'isApprovedForAll', args: [selected.owner, selected.operator]})
-          if (epoch !== generation || key !== scope.value) return
+          if (!current()) return
           if (typeof value !== 'boolean') throw new Error('Permission response was not a boolean.')
           row.approved = value
           row.error = ''
         } catch {
-          if (epoch !== generation || key !== scope.value) return
+          if (!current()) return
           row.approved = null
           row.error = 'Could not read permission. Refresh before trying again.'
         } finally {
-          if (epoch === generation && key === scope.value) row.loading = false
+          if (current()) row.loading = false
         }
       }))
     }
-  } finally {
-    refreshing = false
+  } catch {
+    if (!current()) return
+    // Client construction can fail before any row's asynchronous read starts.
+    for (const row of rows.value) {
+      row.approved = null
+      row.loading = false
+      row.error = 'Could not read permission. Refresh before trying again.'
+    }
   }
 }
 
 watch(scope, () => {
+  contextGeneration++
   generation++
+  queued = false
   rows.value = identity.value ? collections.value.map(row => ({...row, approved: null, loading: false, error: ''})) : []
   void refresh()
-}, {immediate: true})
+}, {immediate: true, flush: 'sync'})
+
+watch(() => market.busy.value, busy => {
+  if (busy) {
+    generation++
+    queued = !!identity.value
+    for (const row of rows.value) {
+      row.approved = null
+      row.loading = false
+      row.error = ''
+    }
+  } else if (queued) void refresh()
+}, {flush: 'sync'})
 
 async function revoke(row: Row) {
   const selected = identity.value
   const key = scope.value
-  if (!selected || row.approved !== true || row.loading || market.busy.value) return
+  const epoch = contextGeneration
+  if (disposed || !selected || !rows.value.includes(row) || row.approved !== true || row.loading || market.busy.value) return
   const build = () => {
-    if (scope.value !== key) throw new Error('The account or network changed. Check the permission again.')
+    if (disposed || epoch !== contextGeneration || scope.value !== key || !rows.value.includes(row)) throw new Error('The account or network changed. Check the permission again.')
     return [{...revokeCollectionCall(row.collection, selected.operator, row.name), guard: () => {
-      if (scope.value !== key) throw new Error('The account or network changed. Check the permission again.')
+      if (disposed || epoch !== contextGeneration || scope.value !== key || !rows.value.includes(row)) throw new Error('The account or network changed. Check the permission again.')
     }}]
   }
   const after = async () => {
     // A real receipt is required by run before this callback can execute.
-    if (scope.value !== key) return
+    if (disposed || epoch !== contextGeneration || scope.value !== key || !rows.value.includes(row)) return
     emit('changed')
   }
   await market.run(build, {after, success: 'Exchange access removed.'})
-  if (scope.value === key) await refresh()
+  // The busy watcher drains the queued read after success or failure.
 }
 
+const resume = () => {if (!document.hidden) void refresh()}
 onMounted(() => {
   timer = setInterval(() => {if (!document.hidden) void refresh()}, 5000)
+  document.addEventListener('visibilitychange', resume)
+  window.addEventListener('focus', resume)
 })
-onUnmounted(() => {generation++; clearInterval(timer)})
+onUnmounted(() => {
+  disposed = true
+  queued = false
+  generation++
+  contextGeneration++
+  clearInterval(timer)
+  document.removeEventListener('visibilitychange', resume)
+  window.removeEventListener('focus', resume)
+})
 </script>
 
 <template>
