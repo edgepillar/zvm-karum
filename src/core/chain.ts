@@ -42,7 +42,9 @@ export function onBlock(fn: (head: number) => void): () => void {
 }
 
 let timer: number | undefined
-let lastSeen = 0
+let lastSeen: number | null = null
+let generation = 0
+let reading: {generation: number; promise?: Promise<void>} | null = null
 const gaps: number[] = []
 
 // A hidden tab does not poll. Every page refreshes on the beat, so a
@@ -51,19 +53,36 @@ const gaps: number[] = []
 // Coming back polls at once, and the listeners catch the page up.
 const hidden = () => typeof document !== 'undefined' && document.hidden
 
-async function poll() {
+function poll(): Promise<void> | undefined {
   if (!reachable.value || endpoint.chainId === null || hidden()) return
+  const selected = generation
+  if (reading?.generation === selected) return reading.promise
+  const rpc = endpoint.rpc, chainId = endpoint.chainId
+  const current = () => generation === selected && endpoint.rpc === rpc &&
+    endpoint.chainId === chainId && reachable.value && !hidden()
+  // Register ownership before a client or reactive callback can reenter poll.
+  const owner: {generation: number; promise?: Promise<void>} = {generation: selected}
+  reading = owner
+  owner.promise = read(chainId, current).finally(() => {
+    if (reading === owner) reading = null
+  })
+  return owner.promise
+}
+
+async function read(chainId: number, current: () => boolean): Promise<void> {
   try {
-    const client = publicClient(endpoint.chainId)
+    const client = publicClient(chainId)
     // The height first, and the block only when it moved: a block lands about
     // every fifteen seconds and this runs every three, so four reads in five
     // were a whole block to learn nothing changed. cacheTime 0 because viem
     // otherwise caches the height for its polling interval.
     const number = await client.getBlockNumber({cacheTime: 0})
-    chain.chainId = endpoint.chainId
+    if (!current()) return
+    chain.chainId = chainId
     chain.error = null
     if (Number(number) === lastSeen) return
     const block = await client.getBlock({blockNumber: number})
+    if (!current()) return
     const head = Number(block.number)
     chain.baseFee = block.baseFeePerGas ?? null
     if (head !== lastSeen) {
@@ -84,12 +103,12 @@ async function poll() {
       onBlockListeners.forEach((fn) => fn(head))
     }
   } catch (err: any) {
-    chain.error = err?.shortMessage ?? err?.message ?? String(err)
+    if (current()) chain.error = err?.shortMessage ?? err?.message ?? String(err)
   }
 }
 
 export function startChainPolling(intervalMs = 3000) {
-  if (timer) return
+  if (timer !== undefined) return
   poll()
   timer = window.setInterval(poll, intervalMs)
   document.addEventListener('visibilitychange', () => {
@@ -100,14 +119,20 @@ export function startChainPolling(intervalMs = 3000) {
 // A new node is a new chain until proven otherwise: drop what the old one said
 // rather than showing its head height under the new endpoint's name.
 watch(
-  () => endpoint.rpc,
+  () => [endpoint.rpc, endpoint.chainId, endpoint.health],
   () => {
-    lastSeen = 0
+    generation++
+    reading = null
+    lastSeen = null
     gaps.length = 0
+    chain.chainId = null
     chain.head = null
     chain.timestamp = null
     chain.baseFee = null
+    chain.interval = 15
+    chain.landedAt = Date.now()
     chain.error = null
-    poll()
+    return poll()
   },
+  {flush: 'sync'},
 )
