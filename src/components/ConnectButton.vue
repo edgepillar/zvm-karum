@@ -26,27 +26,42 @@ const copied = ref(false)
 const balance = ref<bigint | null>(null)
 
 let off: (() => void) | undefined
+let balanceAlive = true
+let balanceGeneration = 0
 onMounted(() => {
   wallets.value = requestWallets()
   off = onWallets(() => (wallets.value = knownWallets()))
 })
-onUnmounted(() => off?.())
+onUnmounted(() => {
+  balanceAlive = false
+  balanceGeneration++
+  balance.value = null
+  off?.()
+})
 
 const canConnect = computed(() => endpoint.health === 'ok' && endpoint.chainId !== null)
 const mine = computed(() => activity.items.filter((a) => a.chainId === endpoint.chainId))
 
+// The amount is only visible in the account menu. Do not start background
+// balance work for a closed menu or let an older context replace its contents.
 async function readBalance() {
-  if (!wallet.address || endpoint.chainId === null) {
-    balance.value = null
-    return
-  }
+  const generation = ++balanceGeneration
+  const address = wallet.address, chainId = endpoint.chainId, rpc = endpoint.rpc, head = chain.head
+  balance.value = null
+  if (!balanceAlive || !account.value || !address || chainId === null ||
+      wallet.chainId !== chainId || endpoint.health !== 'ok') return
+  const current = () => balanceAlive && account.value && generation === balanceGeneration &&
+    wallet.address === address && wallet.chainId === chainId && endpoint.chainId === chainId &&
+    endpoint.rpc === rpc && endpoint.health === 'ok' && chain.head === head
   try {
-    balance.value = await publicClient(endpoint.chainId).getBalance({address: wallet.address})
+    const next = await publicClient(chainId).getBalance({address})
+    if (current()) balance.value = next
   } catch {
-    balance.value = null
+    if (current()) balance.value = null
   }
 }
-watch(() => [wallet.address, endpoint.chainId, chain.head], readBalance)
+watch(() => [account.value, wallet.address, wallet.chainId, endpoint.chainId, endpoint.rpc, endpoint.health, chain.head],
+  readBalance, {flush: 'sync'})
 
 // The wallet reads as its ZNS primary name when it has one.
 const primary = computed(() => cachedName(wallet.address))

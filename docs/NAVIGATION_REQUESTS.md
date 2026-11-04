@@ -28,3 +28,15 @@ so unmount can always detach it. Invalid item routes clear old data and settle
 with an explicit error. Token IDs remain strings and valid-route signing and
 settlement code is unchanged. This regression requires zero failed page HTTP
 responses rather than accepting the passing main checks alone.
+
+
+The header account menu now reads its native balance only while open, with a
+connected account on the selected healthy chain. A close, account/chain/RPC/head
+change or unmount invalidates the displayed amount and every older completion.
+Generation and captured-context checks prevent both late success and late failure
+from replacing the current menu, including an A-to-B-to-A transition. A reopened
+menu starts a fresh read. Amounts remain bigint values from the production client;
+requests are not fabricated, retried or substituted. In-flight HTTP cancellation
+and the earlier browser navigation timeout cause are not established by this fix.
+The complete original marketplace signature/receipt/balance predicates and all
+52 production-browser profiles remain required in the Node integration lane.
