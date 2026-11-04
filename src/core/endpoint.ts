@@ -141,23 +141,26 @@ export function base(): string {
 /** Points the app at a different node and re-checks it. */
 export async function setEndpoint(input: string): Promise<boolean> {
   const url = normalize(input)
+  selectionGeneration++
+  checking = null
   if (!url) {
-    endpoint.error = 'That is not a URL.'
-    endpoint.hint = `Try ${DEFAULT_RPC}`
-    endpoint.health = 'error'
+    fail('That is not a URL.', `Try ${DEFAULT_RPC}`)
     return false
   }
+  endpoint.health = 'checking'
+  clearChain()
   endpoint.rpc = url
   save(url)
   return check()
 }
 
 class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly statusText: string,
-  ) {
+  readonly status: number
+  readonly statusText: string
+  constructor(status: number, statusText: string) {
     super(`${status} ${statusText}`)
+    this.status = status
+    this.statusText = statusText
   }
 }
 
@@ -185,20 +188,26 @@ async function infoOf(apiBase: string): Promise<ChainInfo | null> {
   }
 }
 
-let checking: Promise<boolean> | null = null
+// Each explicit selection owns its result, including an A-to-B-to-A change.
+let selectionGeneration = 0
+let checking: {url: string; generation: number; promise: Promise<boolean>} | null = null
 
 /** Asks the node for its chain id and its deployment, and classifies the failure when it does not answer. */
 export function check(): Promise<boolean> {
-  if (checking) return checking
-  checking = run().finally(() => {
-    checking = null
+  const url = endpoint.rpc
+  const generation = selectionGeneration
+  if (checking?.url === url && checking.generation === generation) return checking.promise
+  const current = () => selectionGeneration === generation && endpoint.rpc === url
+  const promise: Promise<boolean> = run(url, current).finally(() => {
+    if (checking?.promise === promise) checking = null
   })
-  return checking
+  checking = {url, generation, promise}
+  return promise
 }
 
-async function run(): Promise<boolean> {
-  const url = endpoint.rpc
+async function run(url: string, current: () => boolean): Promise<boolean> {
   endpoint.health = 'checking'
+  clearChain()
   endpoint.error = null
   endpoint.hint = null
 
@@ -220,8 +229,10 @@ async function run(): Promise<boolean> {
   for (const candidate of candidates) {
     try {
       const chainId = await chainIdOf(candidate, 8000)
+      if (!current()) return false
       const apiBase = /\/rpc$/.test(candidate) ? candidate.replace(/\/rpc$/, '') : null
       const info = apiBase ? await infoOf(apiBase) : null
+      if (!current()) return false
       endpoint.rpc = candidate
       save(candidate)
       endpoint.chainId = chainId
@@ -233,9 +244,11 @@ async function run(): Promise<boolean> {
       endpoint.hint = null
       return true
     } catch (err) {
+      if (!current()) return false
       last = err
     }
   }
+  if (!current()) return false
   describe(last, url)
   return false
 }
@@ -272,14 +285,18 @@ export function hostOf(url: string): string {
   }
 }
 
-function fail(error: string, hint: string | null) {
-  endpoint.health = 'error'
-  endpoint.error = error
-  endpoint.hint = hint
+function clearChain() {
   endpoint.latency = null
   endpoint.chainId = null
   endpoint.apiBase = null
   endpoint.info = null
+}
+
+function fail(error: string, hint: string | null) {
+  endpoint.health = 'error'
+  endpoint.error = error
+  endpoint.hint = hint
+  clearChain()
 }
 
 export const reachable = computed(() => endpoint.health === 'ok')
